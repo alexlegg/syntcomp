@@ -10,4 +10,5 @@ main = execParser opts >>= run
                      <*> flag False True (long "underapprox" <> short 'u' <> help "Compute an under approximation of the winning set and terminate early with WIN if it still contains the initial set")
                      <*> flag False True (long "earlyunder"  <> short 't' <> help "Terminate early when computing the under approx winning set")
                      <*> argument O.str (metavar "INPUT")
+                     <*> flag Nothing Nothing internal
 

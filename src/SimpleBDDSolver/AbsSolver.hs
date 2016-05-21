@@ -25,6 +25,7 @@ import Control.Monad.Trans.Either
 import Control.Monad.Trans
 import Control.Arrow
 import Control.Monad.Trans.State
+import Control.Concurrent
 
 import Safe
 import Data.Attoparsec.Text as P
@@ -179,10 +180,20 @@ makeMap controllableInputs uncontrollableInputs latches ands = Map.unions [cInpu
     andMap    = Map.fromList $ map (\(x, y, z) -> (x, And y z)) ands
 
 --Leaves untracked vars in place
-safeCpre' :: (Show a, Eq a) => Bool -> Ops s a -> SynthStateDynamic a -> [a] -> a -> a -> ST s a
-safeCpre' quiet ops@Ops{..} ssd@SynthStateDynamic{..} trel safeRegion s = do
+safeCpre' :: (Show a, Eq a) => Bool -> Maybe (MVar [[Int]]) -> Ops s a -> SynthStateDynamic a -> [a] -> a -> a -> ST s a
+safeCpre' quiet hv ops@Ops{..} ssd@SynthStateDynamic{..} trel safeRegion s = do
     when (not quiet) $ unsafeIOToST $ print "*"
-    scu' <- vectorCompose s trel
+    h <- getHybridStates ops theMap hv 
+
+    scu' <- case h of
+        Just x -> do
+            sh <- bAnd x s
+            deref x
+            res <- vectorCompose s trel
+            deref sh
+            return res
+        Nothing -> vectorCompose s trel
+
 
     scu <- andAbstract cInputCube (neg safeRegion) scu'
     deref scu'
@@ -191,19 +202,34 @@ safeCpre' quiet ops@Ops{..} ssd@SynthStateDynamic{..} trel safeRegion s = do
     deref scu
     return s
 
-safeCpre :: (Show a, Eq a) => Bool -> Ops s a -> SynthStateDynamic a -> [a] -> a -> a -> ST s a
-safeCpre quiet ops@Ops{..} ssd@SynthStateDynamic{..} trel safeRegion s = do
-    su  <- safeCpre' quiet ops ssd trel safeRegion s
+safeCpre :: (Show a, Eq a) => Bool -> Maybe (MVar [[Int]]) -> Ops s a -> SynthStateDynamic a -> [a] -> a -> a -> ST s a
+safeCpre quiet hv ops@Ops{..} ssd@SynthStateDynamic{..} trel safeRegion s = do
+    su  <- safeCpre' quiet hv ops ssd trel safeRegion s
     res <- bexists untrackedCube su
     deref su
     return res
 
-safeCpreUnderApprox :: (Show a, Eq a) => Bool -> Ops s a -> SynthStateDynamic a -> [a] -> a -> a -> ST s a
-safeCpreUnderApprox quiet ops@Ops{..} ssd@SynthStateDynamic{..} trel safeRegion s = do
-    su  <- safeCpre' quiet ops ssd trel safeRegion s
+safeCpreUnderApprox :: (Show a, Eq a) => Bool -> Maybe (MVar [[Int]]) -> Ops s a -> SynthStateDynamic a -> [a] -> a -> a -> ST s a
+safeCpreUnderApprox quiet hv ops@Ops{..} ssd@SynthStateDynamic{..} trel safeRegion s = do
+    su  <- safeCpre' quiet hv ops ssd trel safeRegion s
     res <- bforall untrackedCube su
     deref su
     return res
+
+getHybridStates :: (Show a, Eq a) => Ops s a -> Map Int a -> Maybe (MVar [[Int]]) -> ST s (Maybe a)
+getHybridStates ops@Ops{..} theMap Nothing     = return Nothing
+getHybridStates ops@Ops{..} theMap (Just hv)   = do
+    s <- unsafeIOToST $ swapMVar hv []
+    case (mapM (mapM f) s) of
+        Just [] -> return Nothing
+        Nothing -> return Nothing
+        Just cs -> do
+            cubes   <- mapM ((uncurry computeCube2) . unzip) cs
+            conj    <- computeCube2 cubes (replicate (length cubes) False)
+            mapM deref cubes
+            return $ Just conj
+    where
+        f x = (\b -> (b, x > 0)) <$> Map.lookup (abs x) theMap
 
 fixedPoint :: Eq a => Ops s a -> a -> a -> (a -> ST s a) -> ST s (Maybe a)
 fixedPoint ops@Ops{..} initialState start func = do
@@ -252,15 +278,15 @@ solveSafety varInfoMap options@Options{..} ops@Ops{..} safeRegion = do
     func mayWin = do
         ssd@SynthStateDynamic{..} <- get
         trel                      <- lift $ substitutionArray ops ssd
-        mayWin'                   <- lift $ if noEarly then fixedPointNoEarly ops initialState mayWin (safeCpre quiet ops ssd trel safeRegion) 
-                                                       else fixedPoint        ops initialState mayWin (safeCpre quiet ops ssd trel safeRegion)
+        mayWin'                   <- lift $ if noEarly then fixedPointNoEarly ops initialState mayWin (safeCpre quiet hybridMVar ops ssd trel safeRegion) 
+                                                       else fixedPoint        ops initialState mayWin (safeCpre quiet hybridMVar ops ssd trel safeRegion)
         case mayWin' of
             Nothing      -> return False
             Just mayWin' -> do
 
                 let doPromotion = do
                         toPromote <- lift $ do
-                            winSU     <- safeCpre' quiet ops ssd trel safeRegion mayWin'
+                            winSU     <- safeCpre' quiet hybridMVar ops ssd trel safeRegion mayWin'
                             mayLose   <- bAnd mayWin' (neg winSU)
                             deref winSU
                             toPromote <- pickUntrackedToPromote ops mayLose
@@ -274,8 +300,8 @@ solveSafety varInfoMap options@Options{..} ops@Ops{..} safeRegion = do
 
                 if computeWinUnderApprox then do
                     lift $ ref mayWin'
-                    mustWin <- lift $ if noEarlyUnder then fixedPointNoEarly ops initialState mayWin' (safeCpreUnderApprox quiet ops ssd trel safeRegion)
-                                                      else fixedPoint        ops initialState mayWin' (safeCpreUnderApprox quiet ops ssd trel safeRegion)
+                    mustWin <- lift $ if noEarlyUnder then fixedPointNoEarly ops initialState mayWin' (safeCpreUnderApprox quiet hybridMVar ops ssd trel safeRegion)
+                                                      else fixedPoint        ops initialState mayWin' (safeCpreUnderApprox quiet hybridMVar ops ssd trel safeRegion)
                     case mustWin of 
                         Nothing  -> doPromotion
                         Just win -> lift $ deref win >> return True
@@ -329,5 +355,6 @@ data Options = Options {
     noEarly               :: Bool,
     computeWinUnderApprox :: Bool,
     noEarlyUnder          :: Bool,
-    filename              :: String
+    filename              :: String,
+    hybridMVar            :: Maybe (MVar [[Int]])
 }
